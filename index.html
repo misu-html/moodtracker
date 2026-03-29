@@ -534,48 +534,191 @@ const WX_MAP = {
 const WX_LABEL_CLS = {'Sonnig':'sel-sunny','Bewölkt':'sel-cloudy','Regnerisch':'sel-rainy','Neblig':'sel-foggy'};
 
 // ═══════════════════════════════
-// STORAGE + MIGRATION
+// STORAGE — IndexedDB (persistent)
+// with localStorage migration + fallback
 // ═══════════════════════════════
 const DB_KEY   = 'tagescheck_data';
 const META_KEY = 'tagescheck_meta';
+const IDB_NAME = 'tagescheck';
+const IDB_VER  = 1;
 
-function migrateAndLoad() {
-  const existing = localStorage.getItem(DB_KEY);
-  if (existing) { try { return JSON.parse(existing); } catch(e) { return []; } }
-  const old = ['tc_v5','tc_v4','tagescheck_v4','tagescheck_v3','tagescheck_v2'];
-  for (const k of old) {
+let _idb = null; // IndexedDB instance, set after open
+
+function openIDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VER);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('entries')) {
+        db.createObjectStore('entries', { keyPath: 'date' });
+      }
+      if (!db.objectStoreNames.contains('meta')) {
+        db.createObjectStore('meta', { keyPath: 'key' });
+      }
+    };
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+
+async function idbGetAll() {
+  if (!_idb) return [];
+  return new Promise((res, rej) => {
+    const tx  = _idb.transaction('entries', 'readonly');
+    const req = tx.objectStore('entries').getAll();
+    req.onsuccess = () => res(req.result || []);
+    req.onerror   = () => rej(req.error);
+  });
+}
+
+async function idbSaveAll(entries) {
+  if (!_idb) return;
+  return new Promise((res, rej) => {
+    const tx    = _idb.transaction('entries', 'readwrite');
+    const store = tx.objectStore('entries');
+    entries.forEach(e => store.put(e));
+    tx.oncomplete = () => res();
+    tx.onerror    = () => rej(tx.error);
+  });
+}
+
+async function idbGetMeta() {
+  if (!_idb) return {};
+  return new Promise((res) => {
+    const tx  = _idb.transaction('meta', 'readonly');
+    const req = tx.objectStore('meta').get('main');
+    req.onsuccess = () => res(req.result ? req.result.value : {});
+    req.onerror   = () => res({});
+  });
+}
+
+async function idbSaveMeta(metaObj) {
+  if (!_idb) {
+    // fallback to localStorage
+    localStorage.setItem(META_KEY, JSON.stringify(metaObj));
+    return;
+  }
+  return new Promise((res, rej) => {
+    const tx    = _idb.transaction('meta', 'readwrite');
+    const store = tx.objectStore('meta');
+    store.put({ key: 'main', value: metaObj });
+    tx.oncomplete = () => res();
+    tx.onerror    = () => {
+      localStorage.setItem(META_KEY, JSON.stringify(metaObj));
+      res();
+    };
+  });
+}
+
+async function migrateFromLocalStorage(idb) {
+  // Check if IndexedDB already has data
+  const existing = await new Promise(res => {
+    const tx  = idb.transaction('entries', 'readonly');
+    const req = tx.objectStore('entries').count();
+    req.onsuccess = () => res(req.result);
+    req.onerror   = () => res(0);
+  });
+  if (existing > 0) return; // already migrated
+
+  // Pull from localStorage (any old key)
+  const keys = [DB_KEY, 'tc_v5','tc_v4','tagescheck_v4','tagescheck_v3','tagescheck_v2'];
+  for (const k of keys) {
     const raw = localStorage.getItem(k);
     if (!raw) continue;
     try {
-      const d = JSON.parse(raw);
-      if (Array.isArray(d) && d.length) {
-        localStorage.setItem(DB_KEY, JSON.stringify(d));
-        localStorage.removeItem(k);
-        return d;
+      const data = JSON.parse(raw);
+      if (Array.isArray(data) && data.length > 0) {
+        const tx    = idb.transaction('entries', 'readwrite');
+        const store = tx.objectStore('entries');
+        data.forEach(e => store.put(e));
+        await new Promise(res => { tx.oncomplete = res; tx.onerror = res; });
+        console.log(`Tagescheck: ${data.length} Einträge von localStorage migriert.`);
+        // Don't delete localStorage yet — keep as backup for one session
+        return;
       }
     } catch(e) {}
   }
-  return [];
 }
 
-let DB   = migrateAndLoad();
+// saveMeta now async — wraps idbSaveMeta
+async function saveMeta() {
+  await idbSaveMeta(META);
+  // Also mirror to localStorage as backup
+  try { localStorage.setItem(META_KEY, JSON.stringify(META)); } catch(e) {}
+}
+
+async function persistDB() {
+  // Save entries to IndexedDB
+  await idbSaveAll(DB);
+  // Also mirror to localStorage as backup (size-checked)
+  try {
+    const s = JSON.stringify(DB);
+    if ((s.length * 2 / 1024) < 4000) localStorage.setItem(DB_KEY, s);
+  } catch(e) {}
+}
+
+// Request persistent storage from browser (prevents aggressive clearing)
+async function requestPersistentStorage() {
+  if (navigator.storage && navigator.storage.persist) {
+    const granted = await navigator.storage.persist();
+    console.log('Tagescheck: persistenter Speicher', granted ? 'gewährt' : 'nicht gewährt');
+  }
+}
+
+let DB   = [];
 let META = {};
-try { META = JSON.parse(localStorage.getItem(META_KEY) || localStorage.getItem('tc_meta') || '{}'); } catch(e) {}
 
 let FS = { mood:null, energie:null, water:null, wetter:null, sleep:null,
            medis:false, dankbarkeit:false, sport:false, sozial:false,
            ernaehrung_gut:false, ernaehrung_schlecht:false };
 
 // ═══════════════════════════════
-// INIT
+// INIT — async startup
 // ═══════════════════════════════
 const TODAY = new Date().toISOString().split('T')[0];
 document.getElementById('brand-date').textContent =
   new Date().toLocaleDateString('de-DE',{weekday:'long',day:'numeric',month:'long'});
 
-loadTodayIfExists();
-initZyklus();
-loadWeather();
+async function init() {
+  // Open IndexedDB
+  try {
+    _idb = await openIDB();
+    await migrateFromLocalStorage(_idb);
+    DB   = await idbGetAll();
+    DB.sort((a,b) => a.date.localeCompare(b.date));
+    META = await idbGetMeta();
+    // Fallback: if IDB empty, try localStorage
+    if (!DB.length) {
+      try {
+        const raw = localStorage.getItem(DB_KEY);
+        if (raw) DB = JSON.parse(raw);
+      } catch(e) {}
+    }
+    if (!Object.keys(META).length) {
+      try {
+        META = JSON.parse(localStorage.getItem(META_KEY) || localStorage.getItem('tc_meta') || '{}');
+      } catch(e) {}
+    }
+  } catch(e) {
+    // IndexedDB unavailable — fall back to localStorage entirely
+    console.warn('Tagescheck: IndexedDB nicht verfügbar, nutze localStorage');
+    try {
+      const keys = [DB_KEY,'tc_v5','tc_v4','tagescheck_v4','tagescheck_v3','tagescheck_v2'];
+      for (const k of keys) {
+        const raw = localStorage.getItem(k);
+        if (raw) { DB = JSON.parse(raw); break; }
+      }
+    } catch(e2) {}
+    try { META = JSON.parse(localStorage.getItem(META_KEY) || '{}'); } catch(e2) {}
+  }
+
+  await requestPersistentStorage();
+  loadTodayIfExists();
+  initZyklus();
+  loadWeather();
+}
+
+init();
 
 // ═══════════════════════════════
 // WEATHER — auto via Open-Meteo
@@ -596,7 +739,7 @@ async function loadWeather() {
     const temp = Math.round(d.current.temperature_2m) + '°';
     const wx = {icon, label, temp};
     META.wx = wx; META.wxDate = TODAY;
-    saveMeta();
+    saveMeta(); // async fire-and-forget
     autoSelectWxPill(label);
   } catch(e) {
     // Geolocation unavailable — user picks manually from tiles
@@ -646,7 +789,7 @@ function persistZyklusMeta() {
   const d = new Date(TODAY);
   d.setDate(d.getDate() - (v - 1));
   META.cycleStart = d.toISOString().split('T')[0];
-  saveMeta();
+  saveMeta(); // async, fire-and-forget
 }
 
 function saveMeta() { localStorage.setItem(META_KEY, JSON.stringify(META)); }
@@ -763,7 +906,7 @@ function loadTodayIfExists() {
 // ═══════════════════════════════
 // SAVE
 // ═══════════════════════════════
-function saveEntry() {
+async function saveEntry() {
   const wx = META.wx || null;
   const wetterLabel = FS.wetter || (wx ? wx.label : null);
   // Convert sleep bucket to approx hours for CSV/corr
@@ -791,24 +934,18 @@ function saveEntry() {
   if (idx >= 0) DB[idx] = entry; else DB.push(entry);
   DB.sort((a,b) => a.date.localeCompare(b.date));
 
-  // Storage size check (Bug 8)
   const toast = document.getElementById('toast');
+
+  // Persist to IndexedDB (+ localStorage mirror)
   try {
-    const s = JSON.stringify(DB);
-    if ((s.length * 2 / 1024) > 3500) {
-      toast.textContent = '⚠️ Speicher fast voll — CSV exportieren!';
-      toast.style.color = 'var(--amber)';
-      toast.style.display = 'block';
-      setTimeout(() => { toast.style.display='none'; toast.style.color=''; }, 4500);
-    }
-    localStorage.setItem(DB_KEY, s);
+    await persistDB();
   } catch(e) {
-    alert('Speicher voll! Bitte zuerst CSV exportieren.');
+    alert('Fehler beim Speichern. Bitte CSV exportieren als Backup.');
     return;
   }
 
   persistZyklusMeta(); // write cycleStart only on save
-  _dashDirty = true;  // force dashboard re-render next visit
+  _dashDirty = true;
 
   const btn = document.getElementById('save-btn');
   btn.textContent = '✓ Gespeichert'; btn.classList.add('done');
